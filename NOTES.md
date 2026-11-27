@@ -80,7 +80,7 @@ the node command line, it stays on pure JS.
   `wasm-src/target/`).
 - Anchor: root commit `0793db7` (drand round 34325458, wallet
   `An4J2AMJenmELVHboUgvQfmHAto8QXt6Mu718pdqvZpK`).
-- Build commit: `ee6e9b5` (+ NOTES.md/README.md on top).
+- Build commit: `fbc5b69` (full SHA fbc5b698634b6463b6759b306df734b660b84480; code in `ee6e9b5`).
 - Rebuild the WASM: `cargo build --release --target wasm32-unknown-unknown`
   in `wasm-src/` (Rust 1.74.1 + wasm32-unknown-unknown std, installed
   manually from static.rust-lang.org), then re-embed the base64 into
