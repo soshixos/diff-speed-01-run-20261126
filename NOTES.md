@@ -6,90 +6,112 @@ Deadline: 29 Nov 2026 13:07 WIB (06:07 UTC). Final set drawn from drand round 34
 ## What it is
 
 A faster drop-in for makefun-diff 1.0.0. `solve.js` is an ES module whose
-`run(input)` returns makefun-diff's patch for `{ old, new }`, byte-identical.
+`run(input)` returns makefun-diff's patch for `{ old, new }`.
 
-Two implementations in one file, same algorithm, same script:
+Algorithm: lines split after every `\n` (`\r` stays part of its line); a
+last line without `\n` is a line too. Two lines are equal iff the same
+code units, newline-or-its-absence included. Common prefix kept, then
+common suffix of what is left; between them, unique-line anchors via LIS
++ exact Myers per gap. Patch rendered exactly as the reference renders it
+(hunks, context 3, runs ≤ 6 kept lines apart share a hunk, `%` after a
+line with no trailing newline). Pure JS throughout, so lone surrogates are
+handled natively (no TextEncoder, no WASM special-casing). No state is
+kept between `run()` calls: every call interns its own lines fresh.
 
-1. **WASM fast path** (default): a Rust core (`wasm-src/src/lib.rs`, compiled
-   to WASM, embedded as base64 in `solve.js`) that tokenizes, runs Myers and
-   renders the patch in native code.
-2. **Pure-JS fallback** (`runJS` in `solve.js`): used when WASM cannot load,
-   when a call traps, when the input contains lone surrogates (which
-   `TextEncoder` would lossy-replace), and when `--no-incremental-marking`
-   was forced on the node command line (see below).
+Why anchors beat O(ND) Myers here: each case is 20k-40k lines with
+D ~ 3.5k-4k, so the reference's O(ND) search does ~14M inner steps.
+~15k-22k lines are unique in both texts; the LIS keeps all but ~300 of
+them, so the remaining exact-Myers gaps are tiny (max ~50 lines) and total
+~14k-19k lines. Details that keep the script identical to the reference:
 
-Algorithm (identical script to the reference, by construction): lines split
-after every `\n` (`\r` stays part of its line); a last line without `\n` is a
-line too; common prefix kept, then common suffix; between them Myers's greedy
-search — furthest into the old text wins per diagonal, deletion wins ties,
-no move past either text's end, every equal run followed as far as it goes;
-first path to reach both ends is the script. Patch rendered exactly as the
-reference renders it (hunks, context 3, runs ≤ 6 kept lines apart share a
-hunk, `%` after a line with no trailing newline).
-
-Speed tricks: lines interned to small integer tokens (one int compare per
-snake step); the search runs on typed arrays with a full V trace for
-backtracking (Uint16 while the texts stay under 65,535 lines, Int32 above);
-backtrack pins each step's post-edit point from V[d-1], never from line
-equality. No state is kept between `run()` calls.
+- Uniqueness is keyed by FULL token (line body + newline presence), so a
+  bare last line never anchors to a newline-terminated line with the same
+  body.
+- Adjacent-swap drops: when the LIS would keep the second of two swapped
+  unique lines (Myers keeps the first), or a unique line crossed a
+  repeated line (Myers keeps the repeated one), the unique line is dropped
+  before the LIS.
+- Isolated-anchor drop: a unique line whose neither neighbor is a unique
+  line aligned across is dropped (it sits in a divergent neighborhood,
+  e.g. a moved-block edge, where Myers may drop it).
+- Run-drop repair: dropping a run of 34 consecutive anchors is kept only
+  when the merged gap has STRICTLY fewer edits (fixes moved blocks/tails);
+  attempts are limited to starts whose bounding gaps have a large old/new
+  imbalance (≥ 6), span ≤ 300 lines, budget 30,000.
+- Pair-merge repair: dropping one anchor is kept only when its merged gap
+  has STRICTLY fewer edits; pairs with no edits are skipped; repeat to
+  fixpoint. Gaps are built once and shared (run-drop updates them in
+  place, segments reuse them — no second gapOps pass).
 
 ## Correctness evidence
 
-- Kit `grade-local --driver process`: **4/4 practice cases pass, L1 regrade
-  reproduced byte for byte** (commit ee6e9b5).
-- Fuzz vs the reference: 3,000 small random cases + 60 generator-like
-  medium cases (200–2,000 lines, CRLF/bare endings, repeats, moves) +
-  20 targeted edges (empty texts, lone `\n`, no trailing newline, CRLF,
-  emoji/surrogate pairs, lone surrogates, 100 KB single lines, 5,000
-  repeated lines, reversed texts) — **0 mismatches**.
+- Kit `grade-local --driver process`: **4/4 practice cases pass, L1
+  regrade reproduced byte for byte**.
+- Deterministic fuzz vs the reference (generator, seed
+  sha256(`'anchor-fuzz-v1'` + set), 4 cases/set): **399/400 cases match
+  byte for byte** (sets 0-99). The one miss is set 66 case 0: an equal-D
+  tie-break — the anchor's script has the SAME edit distance as the
+  reference (1107 hunks, 1852 deleted, 2266 inserted) but a different
+  alignment, because a unique-line anchor forces an alignment Myers would
+  not choose (Myers keeps a repeated line the anchor's gap deletes).
+  Per-case failure rate 0.25%, so a 4-case set has ~1% chance of
+  containing such a case. The practice set is 4/4.
+- Port check: the repo's `solve.js` matches the prototype on the same
+  100-case fuzz (0 mismatches, sets 0-24) and reproduces the set 66 miss
+  identically.
+- Targeted edge cases 18/18 pass: empty texts, bare endings, CRLF, lone
+  surrogates (differing and matching), emoji pairs, 100 KB single lines,
+  5,000 repeated lines (kept and shrunk), full reversals, unique-vs-
+  repeated swaps.
 - Determinism: same input twice gives identical bytes (the harness runs
   each entry twice and requires byte-identical outputs).
 
 ## Benchmarks (this VM, Node 24.22.1; harness uses Node 22)
 
-Fresh-process runs of `node main.ts` on the practice set (4 cases),
-median of 7 runs, CPU time:
+Head-to-head in one process, interleaved, 10 reps over the 4 practice
+cases (median total for 4 cases, run() only, no startup/JSON):
 
-| entry | CPU total | net of null control (~211 ms) |
+| entry | median total (4 cases) | per case |
 |---|---|---|
-| house baseline (makefun-diff 1.0.0) | 1,779 ms | 1,568 ms |
-| this entry (WASM path) | 615 ms | 404 ms |
-| this entry (pure-JS fallback) | 848 ms | 637 ms |
+| previous entry (WASM Myers core) | 347 ms | ~87 ms |
+| this entry (anchor+LIS, pure JS) | 296 ms | ~74 ms |
 
-Scored ratio (net of null): **~3.9x faster than the baseline** (WASM path),
-~2.5x (pure-JS fallback). Per case, WASM path: ~60–90 ms CPU vs
-baseline ~290–550 ms. The entry beats the baseline at well over 95%
-confidence on the practice set; the final set is drawn from a different
-drand round but the same generator, so the same shape is expected.
+Speedup: **~1.17x over the previous entry** (~1.4x in fuzz averages,
+which include oracle overhead). Fresh-process `node main.ts` on the
+practice set (CPU, median of 7): 842 ms total including Node startup +
+cases.json parse + answers.json stringify/write; the previous entry
+measured 615 ms the same way in an earlier, quieter VM period, so the
+cross-period totals are not directly comparable — the same-process
+head-to-head above is the reliable number. The house baseline
+(makefun-diff 1.0.0) measured 1,779 ms total / 1,568 ms net of the null
+control (~211 ms) in the earlier period, so this entry is roughly
+5x faster than the baseline on run() time.
 
-## The `--no-incremental-marking` finding
-
-`main.ts` deliberately does NOT set `--no-incremental-marking` (the house
-baseline's driver does). Measured: with that flag, the WASM core runs
-~5x slower (~450–550 ms/case vs ~60–90 ms/case) once its linear memory
-is large (~100 MB), while the pure-JS implementation is unaffected by the
-flag (491 ms vs 493 ms total over 4 cases). The rules allow an entry to
-tune V8's flags, so this entry leaves the default (incremental marking
-on). `solve.js` also checks `process.execArgv`: if the flag was forced on
-the node command line, it stays on pure JS.
+Leaderboard context (27 Nov 2026): the top entries all show cpu_us 0
+("< 10 ms") — a clock-tick artifact (net CPU under one 10 ms tick reads
+0) and/or dev-board-only gaming (e.g. hardcoding the public practice
+answers gives 0 and 4/4 on dev but fails the final set drawn from a
+different drand round). This entry wins on real speed within the rules;
+the final heat (1 warm-up + 9 timed rounds, trimmed mean) on the unseen
+set is what matters.
 
 ## Repo
 
-- Size: ~250 KB total (cap 1 MiB). `solve.js` ~205 KB (of which ~193 KB
-  is the base64 WASM blob), Rust source in `wasm-src/` (excluded:
-  `wasm-src/target/`).
+- Size: ~30 KB total (cap 1 MiB). `solve.js` ~14.5 KB (pure JS, no WASM
+  blob). The old WASM core's Rust source is retained in `wasm-src/` for
+  reference only; the WASM path was removed in this commit (the anchor
+  is faster than the WASM Myers core, and pure JS handles lone
+  surrogates natively).
 - Anchor: root commit `0793db7` (drand round 34325458, wallet
   `An4J2AMJenmELVHboUgvQfmHAto8QXt6Mu718pdqvZpK`).
-- Build commit: `fbc5b69` (full SHA fbc5b698634b6463b6759b306df734b660b84480; code in `ee6e9b5`).
-- Rebuild the WASM: `cargo build --release --target wasm32-unknown-unknown`
-  in `wasm-src/` (Rust 1.74.1 + wasm32-unknown-unknown std, installed
-  manually from static.rust-lang.org), then re-embed the base64 into
-  `solve.js` (replace the `WASM_B64` string) and re-run the fuzz +
-  practice checks before committing.
+- Previous build (WASM entry): commit `af7e4dd`
+  (af7e4dd7d242d84dd772ae2111ab1fab5159b92f).
+- This build: anchor+LIS pure-JS entry (commit below).
 
 ## Before submit (parent)
 
-See `../diff-speed-01-run-20261126-SUBMIT-HANDOFF.md`: create/push the
-GitHub repo (or enter via `--source` bundle), add the README badges +
-About, bundle transcripts, run `makefun check`, then submit before
-29 Nov 2026 13:07 WIB. Do NOT submit without Yuni's approval.
+See `../diff-speed-01-run-20261126-SUBMIT-HANDOFF.md`: bundle transcripts,
+run `makefun check`, then submit before 29 Nov 2026 13:07 WIB. Do NOT
+submit without Yuni's approval. Note the 1/400 equal-D caveat above when
+deciding — the previous (exact, slower) entry remains in git history at
+`af7e4dd` if a revert is wanted.
